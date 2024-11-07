@@ -9,7 +9,7 @@ We help IT teams worldwide to fully automate their Kubernetes and cloud native o
 > [KubeLB](https://www.kubermatic.com/products/kubelb/) - Our load balancer solution
 
 > [KCS](https://www.kubermatic.com/products/kubermatic-cloud-stack/) - Our new tool for you to build your private cloud entirely with Kubernetes
-> 
+
 > [KDP](https://www.kubermatic.com/products/kubermatic-developer-platform/) - Our tool to make the lives of developers easier
 
 
