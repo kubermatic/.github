@@ -1,0 +1,129 @@
+name: Prevent Unauthorized LGTM and Approved Labels
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "Pull request number"
+        required: true
+        type: string
+      repository:
+        description: "Repository name"
+        required: true
+        type: string
+    secrets:
+      GH_TOKEN:
+        description: "GitHub token"
+        required: true
+
+env:
+  AUTHORIZED_USER: "kubermatic-bot"
+  LGTM_LABEL: "lgtm"
+  APPROVED_LABEL: "approved"
+
+jobs:
+  check_lgtm_approved_authorization:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Check LGTM and Approved label authorization
+        run: |
+          PR_NUMBER="${{ inputs.pr_number }}"
+          REPO="${{ inputs.repository }}"
+          UNAUTHORIZED_LABELS=()
+
+          # Function to check and remove unauthorized label
+          check_label() {
+            local label_name="$1"
+            local label_display_name="$2"
+            local current_labels="$3"
+
+            # Check if the label currently exists on the PR using the passed labels
+            local label_exists=$(echo "$current_labels" | jq -r '.labels[] | select(.name == "'$label_name'") | .name' 2>/dev/null)
+
+            # Only proceed if the label actually exists
+            if [ "$label_exists" = "$label_name" ]; then
+              # Get who added the label
+              local added_by=$(echo "$TIMELINE_RESPONSE" | \
+                         jq -r 'reverse | .[] | select(.event == "labeled" and .label.name == "'$label_name'") | .actor.login | select(. != null)' 2>/dev/null | head -1)
+
+              if [ "$added_by" != "" ] && [ "$added_by" != "$AUTHORIZED_USER" ]; then
+                echo "$label_display_name label was manually added by unauthorized user: $added_by"
+                UNAUTHORIZED_LABELS+=("$label_display_name by @$added_by")
+
+                # Remove unauthorized label
+                curl -s -X DELETE \
+                     -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
+                     -H "Accept: application/vnd.github.v3+json" \
+                     "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels/$label_name"
+
+                echo "Removed unauthorized $label_display_name label"
+              elif [ "$added_by" = "$AUTHORIZED_USER" ]; then
+                echo "$label_display_name label was added by authorized user"
+              fi
+            else
+              echo "$label_display_name label does not exist on PR, skipping check"
+            fi
+          }
+
+          # Get PR timeline to find who added the labels (most recent additions only)
+          TIMELINE_RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
+                         -H "Accept: application/vnd.github.v3+json" \
+                         "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/timeline")
+
+          # Validate JSON response before parsing
+          if ! echo "$TIMELINE_RESPONSE" | jq empty >/dev/null 2>&1; then
+            echo "Error: Invalid JSON response from timeline API"
+            exit 1
+          fi
+
+          # Get current PR labels once
+          CURRENT_PR_LABELS=$(curl -s -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
+                              -H "Accept: application/vnd.github.v3+json" \
+                              "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER")
+
+          # Validate PR labels response
+          if ! echo "$CURRENT_PR_LABELS" | jq empty >/dev/null 2>&1; then
+            echo "Error: Invalid JSON response from PR API"
+            exit 1
+          fi
+
+          # Check both labels using the function
+          check_label "$LGTM_LABEL" "LGTM" "$CURRENT_PR_LABELS"
+          check_label "$APPROVED_LABEL" "Approved" "$CURRENT_PR_LABELS"
+
+          # If any unauthorized labels were found, post comment and fail
+          if [ ${#UNAUTHORIZED_LABELS[@]} -gt 0 ]; then
+            # Build comment message with proper newlines
+            COMMENT="The following labels were manually added and have been automatically removed:\n\n"
+
+            for label_info in "${UNAUTHORIZED_LABELS[@]}"; do
+              COMMENT+="- $label_info\n"
+            done
+
+            COMMENT+="\nPlease use the appropriate Prow commands:\n"
+            COMMENT+="- \`/lgtm\` for LGTM label\n"
+            COMMENT+="- \`/approve\` for Approved label\n"
+            COMMENT+="\nThese commands should be run by code owners or reviewers.\n\n"
+            COMMENT+="For more information see [the Code Review Process](https://git.k8s.io/community/contributors/guide/owners.md#the-code-review-process).\n\n"
+            COMMENT+="The full list of commands accepted by this bot can be found [here](https://go.k8s.io/bot-commands?repo=kubermatic%2Fdashboard)."
+
+            # Convert \n to actual newlines
+            COMMENT=$(echo -e "$COMMENT")
+
+            curl -s -X POST \
+                 -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
+                 -H "Accept: application/vnd.github.v3+json" \
+                 -d "$(jq -n --arg body "$COMMENT" '{body: $body}')" \
+                 "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments"
+
+            echo "Posted comment about removed labels"
+
+            # Fail the workflow to create a red status check
+            exit 1
+          else
+            echo "All labels were properly authorized or not present"
+          fi
